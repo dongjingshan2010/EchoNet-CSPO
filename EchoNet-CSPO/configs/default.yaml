@@ -1,0 +1,180 @@
+# ============================================================
+# EchoNet-CSPO-mamba3ActorPriod-R21D-derectEF-CSPO
+#
+# 架构（三动作策略 + CSPO 反事实步级策略优化）:
+#
+#   Mamba 分支  ResNet + BiMamba → volume (B,T) + policy(3类) + value
+#               RL 动作 = {0=skip, 1=select_as_ED, 2=select_as_ES}
+#               EDV = mean(vol[action==1])   ESV = mean(vol[action==2])
+#               EF_mamba = (EDV - ESV) / EDV × 100
+#               训练信号: PPO(RL奖励) + SmoothL1(EF_mamba, EF_gt) + TV(volume)
+#
+#   R21D 分支  volumes.detach() → 容积峰值检测 → 划分心动周期
+#               每个周期: frames[t0:t1] → R21D → EF_cycle_i
+#               EF_r21d = weighted_mean(EF_cycle_1, ..., EF_cycle_k)
+#               训练信号: SmoothL1(EF_r21d, EF_gt)（纯监督，与 RL 解耦）
+#
+# 约束: 算法全程不依赖 ED_Frame / ES_Frame 索引和关键帧容积标签
+# ============================================================
+
+data:
+#  filelist: ../../data/Echo/FileList_with_frames.csv
+#  videos_dir: ../../data/Echo/Videos
+  filelist: ../../data/VideosA4C/FileList_with_frames.csv
+  videos_dir: ../../data/VideosA4C/VideosA4C
+
+  frame_size: 112            # 统一 112×112（R21D 需要，Mamba 兼容）
+  frame_stride: 2
+  max_steps: 150             # 每次截取最多 150 帧
+  min_frames_keep: 32
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std:  [0.229, 0.224, 0.225]
+  no_label_mode: true        # 窗口随机采样，不依赖 ED/ES 位置
+
+model:
+  backbone: resnet34          # resnet18/34/50
+  pretrained: true
+  freeze_backbone_warmup: 500 # 前 N updates 冻结 ResNet backbone
+  policy_skip_bias_init: 2.5  # v5.1: 3.5->2.5 (3.5 过强→argmax 永远停 skip,eval ed=es=0; 2.5→初始选帧率~14%,argmax 可翻面)
+  d_model: 256
+  nhead: 8
+  num_layers: 4
+  dim_ff: 1024
+  dropout: 0.1
+  max_volume_ml: 300.0        # volume_head 输出上限 (mL)
+
+  encoder_type: mamba         # mamba | hierarchical | flat
+  mamba:
+    num_layers: 5
+    d_state: 16
+    d_conv: 8
+    expand: 2
+    use_official: true
+    stochastic_depth_prob: 0.05
+
+  hierarchical:
+    enabled: false
+    window_size: 12
+    num_local_layers: 5
+    num_global_layers: 7
+    fuse_mode: add
+
+  # ── R21D 多周期 EF 头 ──────────────────────────────────────
+  r2plus1d_ef:
+    pretrained: true          # Kinetics-400 预训练
+    clip_len: 32
+    use_checkpoint: true
+    freeze_warmup: 1000
+
+    ef_mean: 55.0
+    ef_scale: 35.0
+    use_formula_head: false      # 已关闭：EDV/ESV 无直接监督标签，公式路径梯度信号弱
+    vol_edv_mean: 100.0          # （以下公式路径参数保留供 use_formula_head: true 时使用）
+    vol_edv_scale: 80.0
+    vol_esv_mean:  45.0
+    vol_esv_scale: 40.0
+    ensemble_alpha_init: 0.5
+
+    # ── 心动周期检测参数 ──────────────────────────────────────
+    min_cycle_frames: 20
+    max_cycles: 4
+    target_cycle_frames: 64
+    cycle_quality_weighting: true
+    cycle_detect_warmup: 2000
+    cycle_smooth_sigma: 3.0
+    cycle_prominence_ratio: 0.15
+    span_margin: 6               # ED 边界向两端各扩展 6 帧，给 R21D 对称时间上下文
+
+rl:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.01          # v5: 0.05->0.01 (3类熵正则反而推向均匀=过选; 改由 skip-bias+sparsity+alignment 防塌缩)
+  value_coef: 0.5
+  epochs_per_update: 2
+  max_grad_norm: 0.5          # Mamba 分支梯度裁剪上限
+  r21d_grad_norm: 1.0         # v5.1: R21D 分支独立裁剪上限（与 mamba 分开，互不连累）
+
+  # ── 监督损失权重 ─────────────────────────────────────────
+  # v5(移植自 mamba3Actor) 无标签弱监督修复
+  soft_ef_loss_coef: 1.0      # Fix A: 与策略无关的容积曲线 EF 锚（主监督 volume head，始终开启）
+  soft_ef_tau: 6.0            # soft-max/min 温度（numpy 复算 τ=6 偏差<1）
+  mamba_ef_loss_coef: 0.3     # v5: 0.8->0.3，且改为 warmup 后 ramp 介入（早期与锚冲突）
+  vol_smooth_loss_coef: 0.02  # v5: 0.05->0.02，语义改为二阶曲率（见 train: volume_curvature_loss）
+  select_sparsity_coef: 1.5   # v5 反塌缩：对 mean_p_sel 超过 target 的部分平方 hinge 惩罚
+  select_target_ratio: 0.25   # V1.5: 0.20→0.25（适当放宽选帧上限，为 ES 腾出空间）
+  # ── R21D 分支损失（保持不动）──────────────────────────────
+  r21d_ef_loss_coef: 1.0
+  r21d_per_cycle_coef: 0.3
+
+# v5(移植自 mamba3Actor) Fix B: 容积曲线 → 逐帧 ED/ES 自蒸馏对齐（治策略塌缩）
+align:
+  enabled: true
+  coef: 2.5                  # V1.5: 1.5→2.5（加强整体对齐信号，与 es_weight_factor 配合）
+  warmup_updates: 50         # V1.5: 150→50（更早开启对齐，容积曲线在 soft_ef 下~50步已成形）
+  ramp_updates: 100          # V1.5: 200→100（50~150 线性 ramp 到满权重）
+  ed_thresh: 0.8             # V1.5: 1.2→0.8（降低阈值：局部 z-score 下 ES 谷 z≈−1.2 踩阈
+                             # 值→ p_es≈0.5 太弱；降到 0.8 后 p_es=sigmoid((1.2-0.8)*3)≈0.77
+                             # 明显增强 ES 软目标强度，治 z-score 不对称）
+  sharpness: 3.0             # 软目标陡峭度，概率质量集中在真极值帧（不变）
+  es_weight_factor: 2.0      # V1.5 新增：ES 路径梯度倍数（三路独立归一后 ES×2 放大）
+                             # 权重分布：ED=1/4, ES=2/4, skip=1/4（消除帧数+z-score双重不对称）
+  window_size: 24            # v5.2: 滑动窗口局部 z-score 全宽（hw=window_size//2=12，实际窗口25帧）
+                             # 25帧×stride2=50原始帧≈1s≈1个心动周期；每个心动周期的峰谷独立归一化，
+                             # 全序列均匀产生 ED/ES 对齐目标。设为 0 可回退到全局 z-score。
+
+reward:
+  # ── 三动作无标签奖励 ────────────────────────────────────
+  # 动作: 0=skip  1=select_as_ED  2=select_as_ES
+  w_ef: 0.3                   # 终端 EF 误差惩罚（主信号）
+  w_over: 0.03                # v5: 0.01->0.03 每帧被选中（action>0）的稀疏惩罚
+  w_cont: 0.02                # 容积连续性惩罚
+  cont_threshold_ratio: 0.1
+
+  # ── 三动作专用奖励 ──────────────────────────────────────
+  w_min_ed: 3.0               # v5: 0.5->3.0 终端惩罚：未选任何 ED 帧（强逼策略选 ED）
+  w_min_es: 5.0               # V1.5: 0.5→5.0（与 w_min_ed 对称甚至更强，强逼策略选 ES）
+  w_role_sep: 0.15            # 终端惩罚：mean(vol[ES]) > mean(vol[ED])（角色混淆）
+  w_max_es: 0.5               # V1.5: 3.0→0.5（降低 ES 过选惩罚，减少对 ES 选择的阻力）
+  max_es_ratio: 0.12          # V1.5: 0.08→0.12（放宽 ES 选帧比例上限，~18帧/150）
+  w_max_ed: 2.0               # v5 新增：ED 过选惩罚
+  max_ed_ratio: 0.08          # v5 新增
+
+  adaptive_ef_enabled: true
+  adaptive_ef_tanh_scale: 12.0
+  adaptive_ef_max_scale: 1.5
+
+improvements:
+  bidi_encoder_enabled: true
+  bidi_num_layers: 2
+  mean_centered_volume: true
+  volume_mean: 100.0
+  volume_scale: 80.0
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_warmup_updates: 200
+
+# ── CSPO 反事实步级策略优化 ──────────────────────────────
+cspo:
+  lambda: 0.1           # CSPO 损失权重（相对于 PPO）
+  phi: 0.25             # 每步以该概率翻转动作（生成反事实轨迹 B）
+  delta_min: 0.10       # 保证两轨迹至少 10% 有效帧动作不同
+  burn_in: 2000         # 前 N updates 只跑 PPO，CSPO 不激活
+  eps_gate: 0.005       # |ΔR̂_t| 低于此值的步骤不产生因果梯度
+
+train:
+  device: auto
+  amp: true
+  envs_per_update: 4
+  total_updates: 25000
+  lr: 1.0e-4
+  lr_min: 5.0e-6
+  weight_decay: 1.0e-5
+  log_interval: 100
+  eval_interval: 100
+  eval_max_batches: 0
+  save_interval: 50000
+  seed: 42
+  num_workers: 2
+  checkpoint_dir: ../checkpoints
+  log_dir: ../logs
